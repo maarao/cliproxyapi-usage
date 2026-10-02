@@ -77,6 +77,7 @@ class SummaryTests(Base):
         self.assertEqual(s["buckets"][-1]["values"][0], 120)
         self.assertEqual(s["accounts"][0]["name"], "claude vt@example.com")
         self.assertEqual(len(s["failures"]), 1)
+        self.assertEqual(s["totals"]["input"], 3 * (120 - 20 - 50))
         self.assertNotIn("key_hash", s["failures"][0])
 
     def test_series_fold_into_other_and_colors_follow_entity(self):
@@ -87,6 +88,17 @@ class SummaryTests(Base):
         self.assertEqual(s["series"][0], "Maanav")
         self.assertEqual(s["series"][-1], "Other")
         self.assertEqual(sum(s["buckets"][-1]["values"]), 8)
+
+    def test_uncached_input_is_consistent_across_providers(self):
+        codex = record(5) | {"tokens": {"input_tokens": 18922, "cached_tokens": 14848,
+                                                        "output_tokens": 148, "total_tokens": 19070}}
+        claude = record(6) | {"tokens": {"input_tokens": 8, "cached_tokens": 608530, "output_tokens": 1848,
+                                         "reasoning_tokens": 177, "total_tokens": 612585}}
+        codex["request_id"] = "codex"
+        with u.connect(self.db_path) as db:
+            u.store(db, [codex, claude])
+            s = u.summarize(db, self.labels, "24h", now=NOW)
+        self.assertEqual(s["totals"]["input"], (18922 - 14848) + (612585 - 1848 - 608530))
 
     def test_render_escapes_labels(self):
         self.labels_path.write_text(json.dumps({u.key_hash("k-maanav"): "<b>x</b>"}))

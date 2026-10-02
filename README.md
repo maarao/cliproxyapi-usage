@@ -8,7 +8,10 @@ to a queue that readers drain destructively and that expires after
 SQLite every few seconds and serves:
 
 - `/`: a dashboard of tokens or requests over time by client, plus totals by
-  client, upstream account and model, and recent failures (last 24h/7d/30d/90d)
+  client, upstream account and model, and recent failures (last 24h/7d/30d/90d).
+  Providers count input differently (Codex includes cache reads in input,
+  Claude does not and reports cache writes only in the total), so the tables
+  show uncached input as total - output - cached
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON
 - `/healthz`
 

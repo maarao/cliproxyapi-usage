@@ -276,8 +276,12 @@ class Labels:
         return list(dict.fromkeys(self.current().values()))
 
 
+# Providers disagree on input_tokens: OpenAI/Codex includes cached reads, Claude
+# excludes them and reports cache writes only in total_tokens. "input" is therefore
+# derived as total - output - cached: uncached input, including Claude cache writes.
 TOTALS = """COUNT(*) AS requests, SUM(failed) AS failed,
-  SUM(input_tokens) AS input, SUM(cached_tokens) AS cached, SUM(output_tokens) AS output,
+  SUM(MAX(total_tokens - output_tokens - cached_tokens, 0)) AS input,
+  SUM(cached_tokens) AS cached, SUM(output_tokens) AS output,
   SUM(reasoning_tokens) AS reasoning, SUM(total_tokens) AS total, AVG(latency_ms) AS latency"""
 
 
@@ -428,7 +432,7 @@ def chart_svg(summary):
 
 
 def table_html(title, rows, first):
-    head = ("<tr><th>{}</th><th>Requests</th><th>Failed</th><th>Input</th><th>Cached</th>"
+    head = ("<tr><th>{}</th><th>Requests</th><th>Failed</th><th>Uncached input</th><th>Cached input</th>"
             "<th>Output</th><th>Total tokens</th><th>Avg latency</th></tr>").format(escape(first))
     body = "".join(
         f"<tr><td>{escape(str(r['name']))}</td><td>{r['requests']:,}</td><td>{r['failed']:,}</td>"
