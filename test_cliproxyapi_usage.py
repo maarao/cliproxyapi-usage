@@ -144,7 +144,7 @@ class CollectorTests(Base):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         key = Path(self.dir.name) / "key"
         key.write_text("secret\n")
-        c = u.Collector(self.db_path, f"http://127.0.0.1:{server.server_port}", key, 0.05)
+        c = u.Collector(self.db_path, u.Management(f"http://127.0.0.1:{server.server_port}", key), 0.05)
         c.start()
         deadline = time.time() + 5
         with u.connect(self.db_path) as db:
@@ -156,7 +156,89 @@ class CollectorTests(Base):
             self.assertEqual(db.execute("SELECT label FROM accounts").fetchone()[0], "claude vt@example.com")
         c.stop.set()
         server.shutdown()
+        server.server_close()
         self.assertEqual(set(seen_auth), {"Bearer secret"})
+
+
+HOUR = 3600
+
+
+def acct(name, short=None, long=None, blocked=False):
+    w = lambda x: None if x is None else {"used": x[0], "reset": x[1]}  # noqa: E731
+    return {"name": name, "short": w(short), "long": w(long), "blocked": blocked}
+
+
+class RankTests(unittest.TestCase):
+    def test_soonest_weekly_reset_first(self):
+        r = u.rank([acct("late", (10, 1), (40, 100 * HOUR)), acct("soon", (10, 1), (90, 30 * HOUR))], 90)
+        self.assertEqual([a["name"] for a in r], ["soon", "late"])
+        self.assertEqual(u.priorities(r), {"soon": 20, "late": 10})
+
+    def test_blocker_reasons(self):
+        self.assertEqual(u.blocker(acct("x", (95, 1), (10, 1)), 90), "Near short limit")
+        self.assertEqual(u.blocker(acct("x", (10, 1), (10, 1), blocked=True), 90), "Limited")
+        self.assertEqual(u.blocker(acct("x", None, (100, 1)), 90), "Limited")
+        self.assertIsNone(u.blocker(acct("x", (10, 1), (10, 1)), 90))
+
+    def test_near_short_limit_or_exhausted_goes_last(self):
+        r = u.rank([acct("hot", (95, 2 * HOUR), (10, 1 * HOUR)), acct("spent", (0, 1), (100, 2 * HOUR)),
+                    acct("blocked", None, (5, 3 * HOUR), blocked=True), acct("ok", (20, 1), (50, 90 * HOUR))], 90)
+        self.assertEqual(r[0]["name"], "ok")
+        self.assertEqual({a["name"] for a in r[1:]}, {"hot", "spent", "blocked"})
+
+    def test_windows_parse(self):
+        short, long, blocked = u.claude_windows({
+            "five_hour": {"utilization": 14.0, "resets_at": "2026-10-02T08:40:00.319010+00:00"},
+            "seven_day": {"utilization": 89.0, "resets_at": "2026-10-05T10:00:00.319032+00:00"}})
+        self.assertEqual((short["used"], long["used"], blocked), (14.0, 89.0, False))
+        self.assertLess(short["reset"], long["reset"])
+        short, long, blocked = u.codex_windows({"rate_limit": {
+            "allowed": True, "limit_reached": False, "secondary_window": None,
+            "primary_window": {"used_percent": 49, "limit_window_seconds": 604800, "reset_at": 1791408823}}})
+        self.assertEqual((short, long, blocked), (None, {"used": 49.0, "reset": 1791408823}, False))
+        self.assertTrue(u.codex_windows({"rate_limit": {"limit_reached": True}})[2])
+
+
+class PrioritizerTests(Base):
+    def test_sets_changed_priorities_and_skips_providers_with_failures(self):
+        files = [
+            {"name": "codex-a.json", "provider": "codex", "auth_index": "a", "priority": 100,
+             "id_token": {"chatgpt_account_id": "acct-a"}},
+            {"name": "codex-b.json", "provider": "codex", "auth_index": "b", "priority": 10,
+             "id_token": {"chatgpt_account_id": "acct-b"}},
+            {"name": "claude-c.json", "provider": "claude", "auth_index": "c", "priority": None},
+            {"name": "claude-d.json", "provider": "claude", "auth_index": "d", "priority": None},
+        ]
+        codex = {"a": 1791408823, "b": 1791046716}
+
+        class Api:
+            patches = []
+
+            def get(self, path):
+                return {"files": files}
+
+            def call(self, method, path, body=None):
+                self.patches.append(body)
+                return {"status": "ok"}
+
+            def upstream(self, auth_index, url, headers):
+                if auth_index in codex:
+                    assert headers["Chatgpt-Account-Id"] == f"acct-{auth_index}"
+                    return {"rate_limit": {"allowed": True, "primary_window": {
+                        "used_percent": 40, "limit_window_seconds": 604800, "reset_at": codex[auth_index]}}}
+                raise OSError("claude usage unavailable")
+
+        api = Api()
+        with u.connect(self.db_path) as db:
+            u.Prioritizer(self.db_path, api, 300, 90).once(db)
+            rows = {r["auth_index"]: dict(r) for r in db.execute("SELECT * FROM quotas")}
+        self.assertEqual(api.patches, [{"name": "codex-a.json", "priority": 10}, {"name": "codex-b.json", "priority": 20}])
+        self.assertEqual((rows["b"]["position"], rows["a"]["position"]), (1, 2))
+        self.assertEqual(rows["c"]["error"], "claude usage unavailable")
+        with u.connect(self.db_path) as db:
+            html = u.render(u.summarize(db, u.Labels(None), "24h"), "Usage")
+        self.assertIn("Upstream accounts", html)
+        self.assertIn("Unreadable", html)
 
 
 if __name__ == "__main__":

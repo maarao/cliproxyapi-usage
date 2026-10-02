@@ -12,6 +12,7 @@ SQLite every few seconds and serves:
   Providers count input differently (Codex includes cache reads in input,
   Claude does not and reports cache writes only in the total), so the tables
   show uncached input as total - output - cached.
+- an "Upstream accounts" table when reset-aware priority is on (below)
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON
 - `/healthz`
 
@@ -27,8 +28,30 @@ In CLIProxyAPI's config:
 - `redis-usage-queue-retention-seconds` long enough to cover collector
   downtime, e.g. `3600`
 
-The collector reads `/v0/management/usage-queue` and `/v0/management/auth-files`.
+The collector reads `/v0/management/usage-queue` and `/v0/management/auth-files`;
+reset-aware priority also uses `/v0/management/api-call` and
+`PATCH /v0/management/auth-files/fields`.
 Nothing else should drain the usage queue, or records are split between readers.
+
+## Reset-aware priority (optional)
+
+CLIProxyAPI has no routing strategy that looks at rate-limit resets, but it
+prefers higher-`priority` credentials for new sessions. With `--prioritize`,
+every few minutes the service reads each Claude and Codex account's windows
+(through the proxy's `/api-call`, the same calls its web panel makes) and sets
+priorities so that, per provider:
+
+1. accounts that are usable come first: not limited, under
+   `--short-window-limit` (default 90%) of the short window (e.g. Claude's
+   5-hour window), with weekly allowance left;
+2. among those, the soonest weekly reset wins, so allowance that would expire
+   unused gets spent first;
+3. the rest follow, soonest to become usable first.
+
+Only changed priorities are written. If any account of a provider cannot be
+read, that provider is left alone for the round. Established sessions keep
+their account (session affinity), and exhausted accounts still fail over. This
+overwrites hand-set priorities on Claude and Codex credentials.
 
 ## Privacy
 
@@ -58,6 +81,7 @@ services.cliproxyapi-usage = {
   labels = { "48ff0700cad2" = "Alice"; "6a8f36647d26" = "Bob"; };
   listenAddress = "100.64.0.1";              # e.g. a Tailscale address
   openFirewallInterfaces = [ "tailscale0" ];
+  prioritize.enable = true;                  # optional, see above
 };
 ```
 

@@ -57,6 +57,23 @@ in
       type = types.str;
       default = "CLIProxyAPI usage";
     };
+    prioritize = {
+      enable = lib.mkEnableOption ''
+        reset-aware credential priority: every interval, read each Claude and Codex
+        account's rate-limit windows and give the highest priority to the usable
+        account whose weekly window resets soonest. Overwrites any hand-set
+        priorities on those credentials'';
+      interval = mkOption {
+        type = types.ints.positive;
+        default = 300;
+        description = "Seconds between quota checks.";
+      };
+      shortWindowLimit = mkOption {
+        type = types.numbers.between 1 100;
+        default = 90;
+        description = "Percent of the short (e.g. 5-hour) window above which an account is ranked last.";
+      };
+    };
     openFirewallInterfaces = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -94,7 +111,11 @@ in
           "--port" (toString cfg.port)
           "--poll-interval" (toString cfg.pollInterval)
           "--title" cfg.title
-        ];
+        ] + lib.optionalString cfg.prioritize.enable (" " + lib.escapeShellArgs [
+          "--prioritize"
+          "--prioritize-interval" (toString cfg.prioritize.interval)
+          "--short-window-limit" (toString cfg.prioritize.shortWindowLimit)
+        ]);
         # The listen address may not exist yet (e.g. Tailscale still starting); keep retrying.
         Restart = "always";
         RestartSec = 5;

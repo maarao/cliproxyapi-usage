@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS accounts (
   updated REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS quotas (
+  auth_index TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  priority INTEGER,
+  short_used REAL,
+  short_reset REAL,
+  long_used REAL,
+  long_reset REAL,
+  status TEXT NOT NULL,
+  error TEXT,
+  checked REAL NOT NULL
+);
 """
 
 
@@ -157,34 +171,55 @@ def account_labels(payload):
     return out
 
 
+# --- Management API --------------------------------------------------------
+
+class Management:
+    def __init__(self, proxy_url, key_file):
+        self.base = proxy_url.rstrip("/") + "/v0/management"
+        self.key_file = Path(key_file)
+
+    def call(self, method, path, body=None):
+        key = self.key_file.read_text().strip()
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+
+    def get(self, path):
+        return self.call("GET", path)
+
+    def upstream(self, auth_index, url, headers):
+        """GET an upstream URL with a credential's own token (the proxy fills in $TOKEN$)."""
+        resp = self.call("POST", "/api-call", {"auth_index": auth_index, "method": "GET", "url": url,
+                                               "header": headers})
+        if not 200 <= int(resp.get("status_code") or 0) < 300:
+            raise ValueError(f"upstream {url} returned {resp.get('status_code')}")
+        body = resp.get("body")
+        return json.loads(body) if isinstance(body, str) else body
+
+
 # --- Collector -------------------------------------------------------------
 
 class Collector(threading.Thread):
-    def __init__(self, db_path, proxy_url, key_file, interval):
+    def __init__(self, db_path, api, interval):
         super().__init__(daemon=True, name="collector")
         self.db_path = db_path
-        self.base = proxy_url.rstrip("/") + "/v0/management"
-        self.key_file = Path(key_file)
+        self.api = api
         self.interval = interval
         self.stop = threading.Event()
-
-    def get(self, path):
-        key = self.key_file.read_text().strip()
-        req = urllib.request.Request(self.base + path, headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
 
     def drain(self, db):
         total = 0
         while True:
-            batch = self.get(f"/usage-queue?count={QUEUE_BATCH}") or []
+            batch = self.api.get(f"/usage-queue?count={QUEUE_BATCH}") or []
             with db:
                 total += store(db, batch)
             if len(batch) < QUEUE_BATCH:
                 return total
 
     def refresh_accounts(self, db):
-        labels = account_labels(self.get("/auth-files"))
+        labels = account_labels(self.api.get("/auth-files"))
         with db:
             db.executemany(
                 "INSERT INTO accounts (auth_index, label, updated) VALUES (?, ?, ?) "
@@ -211,6 +246,149 @@ class Collector(threading.Thread):
             except (OSError, ValueError, urllib.error.URLError, sqlite3.Error) as e:
                 log.warning("collect failed: %s", e)
                 self.note(db, last_error_at=time.time(), last_error=e)
+            self.stop.wait(self.interval)
+
+
+# --- Reset-aware priority --------------------------------------------------
+#
+# CLIProxyAPI prefers higher-priority credentials for new sessions (established
+# session bindings stay put, and exhausted credentials fail over). Ranking each
+# provider's accounts by soonest weekly reset spends allowance that would
+# otherwise expire unused, while skipping accounts near a short-window limit.
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_HEADERS = {"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json",
+                  "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)"}
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_HEADERS = {"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json",
+                 "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
+LONG_WINDOW_SECONDS = 86400  # windows at least a day long count as the "weekly" allowance
+PRIORITY_STEP = 10
+
+
+def claude_windows(usage):
+    """Anthropic /api/oauth/usage -> (short, long) as {used, reset} dicts or None."""
+    def window(key):
+        w = usage.get(key)
+        if not isinstance(w, dict) or w.get("utilization") is None:
+            return None
+        reset = parse_timestamp(w["resets_at"]) if w.get("resets_at") else None
+        return {"used": float(w["utilization"]), "reset": reset}
+    return window("five_hour"), window("seven_day"), False
+
+
+def codex_windows(usage):
+    """ChatGPT /wham/usage -> (short, long, blocked); windows are sorted by length."""
+    limits = usage.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = limits.get(key)
+        if isinstance(w, dict) and w.get("used_percent") is not None:
+            windows.append((int(w.get("limit_window_seconds") or 0),
+                            {"used": float(w["used_percent"]), "reset": w.get("reset_at")}))
+    short = next((w for secs, w in windows if secs < LONG_WINDOW_SECONDS), None)
+    long = next((w for secs, w in windows if secs >= LONG_WINDOW_SECONDS), None)
+    blocked = bool(limits.get("limit_reached")) or limits.get("allowed") is False
+    return short, long, blocked
+
+
+def blocker(account, short_limit):
+    """Why an account should not take new sessions, or None if it can."""
+    short, long = account["short"], account["long"]
+    if account.get("error"):
+        return "Unreadable"
+    if account["blocked"] or (long and long["used"] >= 100) or (short and short["used"] >= 100):
+        return "Limited"
+    if short and short["used"] >= short_limit:
+        return "Near short limit"
+    return None
+
+
+def usable(account, short_limit):
+    return blocker(account, short_limit) is None
+
+
+def rank(accounts, short_limit):
+    """Order one provider's accounts best-first: usable ones by soonest long-window reset."""
+    def key(a):
+        long, short = a["long"] or {}, a["short"] or {}
+        if usable(a, short_limit):
+            return (0, long.get("reset") or float("inf"), long.get("used") or 0, a["name"])
+        # Unusable accounts go last, soonest to become usable again first.
+        return (1, short.get("reset") or long.get("reset") or float("inf"), 0, a["name"])
+    return sorted(accounts, key=key)
+
+
+def priorities(ranked):
+    return {a["name"]: PRIORITY_STEP * (len(ranked) - i) for i, a in enumerate(ranked)}
+
+
+class Prioritizer(threading.Thread):
+    def __init__(self, db_path, api, interval, short_limit):
+        super().__init__(daemon=True, name="prioritizer")
+        self.db_path = db_path
+        self.api = api
+        self.interval = interval
+        self.short_limit = short_limit
+        self.stop = threading.Event()
+
+    def quota(self, f):
+        if f["provider"] == "claude":
+            return claude_windows(self.api.upstream(f["auth_index"], CLAUDE_USAGE_URL, CLAUDE_HEADERS))
+        headers = dict(CODEX_HEADERS)
+        account_id = (f.get("id_token") or {}).get("chatgpt_account_id")
+        if account_id:
+            headers["Chatgpt-Account-Id"] = account_id
+        return codex_windows(self.api.upstream(f["auth_index"], CODEX_USAGE_URL, headers))
+
+    def once(self, db):
+        files = self.api.get("/auth-files").get("files", [])
+        groups = {}
+        for f in files:
+            provider = f.get("provider") or f.get("type")
+            if provider in ("claude", "codex") and not f.get("disabled") and f.get("auth_index"):
+                groups.setdefault(provider, []).append(f | {"provider": provider})
+        now = time.time()
+        for provider, members in groups.items():
+            accounts, failed = [], False
+            for f in members:
+                a = {"name": f["name"], "auth_index": str(f["auth_index"]), "provider": provider,
+                     "label": f"{provider} {f.get('email') or f['name']}", "priority": f.get("priority"),
+                     "short": None, "long": None, "blocked": False, "error": None}
+                try:
+                    a["short"], a["long"], a["blocked"] = self.quota(f)
+                except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as e:
+                    a["error"], failed = str(e), True
+                accounts.append(a)
+            ranked = rank(accounts, self.short_limit)
+            wanted = priorities(ranked)
+            if failed:  # never reorder a provider on partial information
+                log.warning("%s: quota read failed for some accounts; priorities unchanged", provider)
+            else:
+                for a in accounts:
+                    if a["priority"] != wanted[a["name"]]:
+                        self.api.call("PATCH", "/auth-files/fields", {"name": a["name"], "priority": wanted[a["name"]]})
+                        log.info("%s priority %s -> %s", a["name"], a["priority"], wanted[a["name"]])
+                        a["priority"] = wanted[a["name"]]
+            with db:
+                for position, a in enumerate(ranked, 1):
+                    s, l = a["short"] or {}, a["long"] or {}
+                    db.execute(
+                        "INSERT OR REPLACE INTO quotas VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (a["auth_index"], a["label"], provider, position, a["priority"], s.get("used"),
+                         s.get("reset"), l.get("used"), l.get("reset"),
+                         blocker(a, self.short_limit) or ("Preferred" if position == 1 else "Standby"),
+                         a["error"], now))
+        with db:
+            db.execute("DELETE FROM quotas WHERE checked < ?", (now - 1,))
+
+    def run(self):
+        db = connect(self.db_path)
+        while not self.stop.is_set():
+            try:
+                self.once(db)
+            except (OSError, ValueError, urllib.error.URLError, sqlite3.Error) as e:
+                log.warning("prioritize failed: %s", e)
             self.stop.wait(self.interval)
 
 
@@ -345,6 +523,7 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
                                     (start,))]
     for f in failures:
         del f["key_hash"]
+    quotas = [dict(r) for r in db.execute("SELECT * FROM quotas ORDER BY provider, position")]
     meta = {r["k"]: r["v"] for r in db.execute("SELECT * FROM meta")}
     oldest = db.execute("SELECT MIN(ts) FROM requests").fetchone()[0]
     return {
@@ -357,6 +536,7 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
                     for e, v in zip(edges, values)],
         **tables,
         "failures": failures,
+        "quotas": quotas,
         "collector": {
             "last_ok": float(meta["last_ok"]) if meta.get("last_ok") else None,
             "last_error": meta.get("last_error") or None,
@@ -442,6 +622,35 @@ def table_html(title, rows, first):
     return f"<section><h2>{escape(title)}</h2><table>{head}{body}</table></section>"
 
 
+def until(ts):
+    if not ts:
+        return ""
+    s = max(0, int(float(ts) - time.time()))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
+
+
+def window_cell(used, reset):
+    if used is None:
+        return "—"
+    return f"{used:.0f}% · resets in {until(reset)}" if reset else f"{used:.0f}%"
+
+
+def quotas_html(quotas):
+    if not quotas:
+        return ""
+    rows = "".join(
+        f"<tr><td>{escape(q['label'])}</td><td>{q['position']}</td><td>{escape(q['status'])}</td>"
+        f"<td>{window_cell(q['short_used'], q['short_reset'])}</td>"
+        f"<td>{window_cell(q['long_used'], q['long_reset'])}</td><td>{q['priority'] if q['priority'] is not None else '—'}</td></tr>"
+        for q in quotas)
+    checked = ago(max(q["checked"] for q in quotas))
+    return (f'<section><h2>Upstream accounts</h2><p class="sub">New sessions go to the preferred account in each '
+            f'provider: the soonest weekly reset among accounts with room left. Checked {checked}.</p>'
+            '<table class="quotas"><tr><th>Account</th><th>Rank</th><th>Status</th><th>Short window</th>'
+            f'<th>Weekly window</th><th>Priority</th></tr>{rows}</table></section>')
+
+
 def ago(ts):
     if not ts:
         return "never"
@@ -485,6 +694,8 @@ th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--grid)
 th:first-child, td:first-child { text-align:left; } th { color:var(--ink-2); font-weight:500; }
 td.empty { text-align:center; color:var(--muted); }
 .failures th:not(:last-child), .failures td:not(:last-child) { text-align:left; }
+.quotas th:nth-child(3), .quotas td:nth-child(3) { text-align:left; }
+section p.sub { margin:0 0 8px; }
 details { margin-top:12px; } summary { cursor:pointer; color:var(--ink-2); }
 .status { margin-top:16px; color:var(--muted); font-size:12px; }
 .status .bad { color:var(--critical); }
@@ -567,6 +778,7 @@ def render(summary, title):
 <div class="tiles">{tiles}</div>
 <section><h2 id="chart-title">{unit} by client</h2><div class="legend">{legend}</div>{chart_svg(summary)}
 <details><summary>Chart data</summary><table>{bucket_head}{bucket_rows}</table></details></section>
+{quotas_html(summary["quotas"])}
 {table_html("By client", summary["clients"], "Client")}
 {table_html("By upstream account", summary["accounts"], "Account")}
 {table_html("By model", summary["models"], "Model")}
@@ -623,10 +835,18 @@ def main():
     p.add_argument("--port", type=int, default=8318)
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--title", default="CLIProxyAPI usage")
+    p.add_argument("--prioritize", action="store_true",
+                   help="rank Claude/Codex credentials by soonest weekly reset by setting their priority")
+    p.add_argument("--prioritize-interval", type=float, default=300)
+    p.add_argument("--short-window-limit", type=float, default=90,
+                   help="percent of the short (e.g. 5-hour) window above which an account is skipped")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     init_db(args.db)
-    Collector(args.db, args.proxy_url, args.management_key_file, args.poll_interval).start()
+    api = Management(args.proxy_url, args.management_key_file)
+    Collector(args.db, api, args.poll_interval).start()
+    if args.prioritize:
+        Prioritizer(args.db, api, args.prioritize_interval, args.short_window_limit).start()
     server = ThreadingHTTPServer((args.listen, args.port), make_handler(args.db, Labels(args.labels_file), args.title))
     log.info("dashboard on http://%s:%d", args.listen, args.port)
     server.serve_forever()
