@@ -2,7 +2,7 @@
 
 Usage history and a dashboard for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
-CLIProxyAPI v7 no longer keeps usage totals. It publishes one record per request
+CLIProxyAPI (v7 and later) no longer keeps usage totals. It publishes one record per request
 to a queue that readers drain destructively and that expires after
 `redis-usage-queue-retention-seconds`. This service drains that queue into
 SQLite every few seconds and serves:
@@ -11,7 +11,7 @@ SQLite every few seconds and serves:
   client, upstream account and model, and recent failures (last 24h/7d/30d/90d).
   Providers count input differently (Codex includes cache reads in input,
   Claude does not and reports cache writes only in the total), so the tables
-  show uncached input as total - output - cached
+  show uncached input as total - output - cached.
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON
 - `/healthz`
 
