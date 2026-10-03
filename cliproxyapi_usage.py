@@ -454,17 +454,24 @@ class Labels:
         return list(dict.fromkeys(self.current().values()))
 
 
-# Providers disagree on input_tokens: OpenAI/Codex includes cached reads, Claude
-# excludes them and reports cache writes only in total_tokens. "input" is therefore
-# derived as total - output - cached: uncached input, including Claude cache writes.
-TOTALS = """COUNT(*) AS requests, SUM(failed) AS failed,
-  SUM(MAX(total_tokens - output_tokens - cached_tokens, 0)) AS input,
-  SUM(cached_tokens) AS cached, SUM(output_tokens) AS output,
+# Split input the way T3 Code and CodexBar do: uncached input, cache reads, cache
+# writes. Providers disagree on input_tokens: OpenAI/Codex includes cache reads
+# (total = input + output), while Claude excludes them and reports cache writes
+# only in total_tokens (total = input + cached + writes + output). A record whose
+# parts fit inside its total is Claude-style; the remainder is cache writes.
+_ANTHROPIC_STYLE = "(input_tokens + cached_tokens + output_tokens <= total_tokens)"
+TOTALS = f"""COUNT(*) AS requests, SUM(failed) AS failed,
+  SUM(CASE WHEN {_ANTHROPIC_STYLE} THEN input_tokens
+      ELSE MAX(input_tokens - cached_tokens, 0) END) AS input,
+  SUM(cached_tokens) AS cached,
+  SUM(CASE WHEN {_ANTHROPIC_STYLE}
+      THEN total_tokens - input_tokens - cached_tokens - output_tokens ELSE 0 END) AS cache_write,
+  SUM(output_tokens) AS output,
   SUM(reasoning_tokens) AS reasoning, SUM(total_tokens) AS total, AVG(latency_ms) AS latency"""
 
 
 def _totals(row):
-    d = {k: row[k] or 0 for k in ("requests", "failed", "input", "cached", "output", "reasoning", "total")}
+    d = {k: row[k] or 0 for k in ("requests", "failed", "input", "cached", "cache_write", "output", "reasoning", "total")}
     d["latency_ms"] = round(row["latency"] or 0)
     return d
 
@@ -612,13 +619,14 @@ def chart_svg(summary):
 
 
 def table_html(title, rows, first):
-    head = ("<tr><th>{}</th><th>Requests</th><th>Failed</th><th>Uncached input</th><th>Cached input</th>"
-            "<th>Output</th><th>Total tokens</th><th>Avg latency</th></tr>").format(escape(first))
+    head = ("<tr><th>{}</th><th>Requests</th><th>Failed</th><th>Uncached input</th><th>Cache reads</th>"
+            "<th>Cache writes</th><th>Output</th><th>Total tokens</th><th>Avg latency</th></tr>").format(escape(first))
     body = "".join(
         f"<tr><td>{escape(str(r['name']))}</td><td>{r['requests']:,}</td><td>{r['failed']:,}</td>"
-        f"<td>{compact(r['input'])}</td><td>{compact(r['cached'])}</td><td>{compact(r['output'])}</td>"
+        f"<td>{compact(r['input'])}</td><td>{compact(r['cached'])}</td>"
+        f"<td>{compact(r['cache_write'])}</td><td>{compact(r['output'])}</td>"
         f"<td>{compact(r['total'])}</td><td>{r['latency_ms'] / 1000:.1f}s</td></tr>" for r in rows
-    ) or '<tr><td colspan="8" class="empty">No requests in this range</td></tr>'
+    ) or '<tr><td colspan="9" class="empty">No requests in this range</td></tr>'
     return f"<section><h2>{escape(title)}</h2><table>{head}{body}</table></section>"
 
 

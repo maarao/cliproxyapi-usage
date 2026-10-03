@@ -9,9 +9,9 @@ SQLite every few seconds and serves:
 
 - `/`: a dashboard of tokens or requests over time by client, plus totals by
   client, upstream account and model, and recent failures (last 24h/7d/30d/90d).
-  Providers count input differently (Codex includes cache reads in input,
-  Claude does not and reports cache writes only in the total), so the tables
-  show uncached input as total - output - cached.
+  Input is split like T3 Code and CodexBar do: uncached input, cache reads and
+  cache writes (Claude reports writes only inside its total), so the four token
+  columns plus output always add up to the total.
 - an "Upstream accounts" table when reset-aware priority is on (below)
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON
 - `/healthz`
