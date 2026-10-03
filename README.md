@@ -12,6 +12,11 @@ SQLite every few seconds and serves:
   Input is split like T3 Code and CodexBar do: uncached input, cache reads and
   cache writes (Claude reports writes only inside its total), so the four token
   columns plus output always add up to the total.
+- estimated cost at API list prices, priced like T3 Code: each model's uncached
+  input, cache reads, cache writes and output at their own rates from
+  [LiteLLM's price table](https://github.com/BerriAI/litellm), plus what caching
+  saved. Upstream subscriptions are not billed this way, so it is what the
+  traffic would cost on the API. `--prices-url ''` turns it off.
 - account limit cards (each window as a bar of what is left, with a pace tick)
   when reset-aware priority is on (below)
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON

@@ -202,6 +202,58 @@ class RankTests(unittest.TestCase):
         self.assertTrue(u.codex_windows({"rate_limit": {"limit_reached": True}})[2])
 
 
+class FakePrices(u.Prices):
+    def __init__(self, document):
+        super().__init__(None, None)
+        self.table, self.fetched, self.status = u.parse_rate_table(document), 0.0, "fresh"
+
+
+LITELLM = {
+    "claude-opus-5-5": {"input_cost_per_token": 4e-06, "output_cost_per_token": 2e-05,
+                        "cache_read_input_token_cost": 2e-07, "cache_creation_input_token_cost": 5e-06},
+    "azure/gpt-x": {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05},
+    "azure/eu/gpt-y": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1e-05},
+    "azure/us/gpt-y": {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05},
+    "half-priced": {"input_cost_per_token": 1e-06},
+    "sample_spec": "not a model",
+}
+
+
+class PriceTests(Base):
+    def test_rate_table_rules(self):
+        table = u.parse_rate_table(LITELLM)
+        self.assertEqual(u.lookup_rate(table, "claude-opus-5-5[1m]"), (4e-06, 2e-07, 5e-06, 2e-05))
+        self.assertEqual(u.lookup_rate(table, "gpt-x"), (2e-06, 2e-06, 2e-06, 1e-05))  # consistent alias
+        self.assertIsNone(u.lookup_rate(table, "gpt-y"))  # qualified entries disagree
+        self.assertIsNone(u.lookup_rate(table, "half-priced"))
+        self.assertIsNone(u.lookup_rate({"opus": (1, 1, 1, 1)}, "opus"))
+
+    def test_costs_follow_the_token_split(self):
+        claude = record(6) | {"tokens": {"input_tokens": 8, "cached_tokens": 608530, "output_tokens": 1848,
+                                         "total_tokens": 612585}}
+        other = record(7, model="mystery-model")
+        with u.connect(self.db_path) as db:
+            u.store(db, [claude, other])
+            s = u.summarize(db, self.labels, "24h", metric="cost", now=NOW, prices=FakePrices(LITELLM))
+        want = 8 * 4e-06 + 608530 * 2e-07 + (612585 - 8 - 608530 - 1848) * 5e-06 + 1848 * 2e-05
+        self.assertAlmostEqual(s["totals"]["cost"], want)
+        self.assertAlmostEqual(s["totals"]["savings"], 608530 * (4e-06 - 2e-07))
+        self.assertEqual(s["totals"]["unpriced"], 1)
+        self.assertAlmostEqual(sum(sum(b["values"]) for b in s["buckets"]), want, places=3)
+        self.assertIsNone(s["prices"]["per_million"]["mystery-model"])
+        html = u.render(s, "Usage")
+        self.assertIn("Est. API cost", html)
+        self.assertIn("Prices used", html)
+        self.assertIn("count as $0", html)
+
+    def test_price_cache_round_trip(self):
+        path = Path(self.dir.name) / "prices.json"
+        path.write_text(json.dumps({"fetched": 123.0, "document": LITELLM}))
+        prices = u.Prices("", path)
+        self.assertEqual((prices.status, prices.fetched), ("cached", 123.0))
+        self.assertIsNotNone(prices.rate("claude-opus-5-5"))
+
+
 class LimitsViewTests(unittest.TestCase):
     def test_meter_shows_left_and_pace_tick(self):
         now = 1_000_000.0

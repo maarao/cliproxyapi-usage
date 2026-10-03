@@ -401,6 +401,118 @@ class Prioritizer(threading.Thread):
             self.stop.wait(self.interval)
 
 
+# --- Estimated prices --------------------------------------------------------
+#
+# Mirrors T3 Code: price each model's tokens with LiteLLM's public rate table.
+# Uncached input, cache reads, cache writes and output each have their own rate
+# (reasoning is already inside output). The upstream accounts are subscriptions,
+# so this is what the traffic would cost at API list prices, not what is paid.
+
+PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+PRICES_TTL_SECONDS = 86400
+# Bare family names are ambiguous across generations; synthetic messages are never billed.
+UNPRICEABLE_MODELS = {"<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable"}
+
+
+def _rate(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 and v != float("inf") else None
+
+
+def parse_rate_table(document):
+    """LiteLLM document -> {model key: (input, cache read, cache write, output) per token}.
+    Models without both an input and an output rate are dropped rather than half-priced.
+    A bare name is aliased to provider-qualified entries only when they all agree."""
+    table = {}
+    for name, entry in (document.items() if isinstance(document, dict) else ()):
+        if not isinstance(entry, dict):
+            continue
+        inp, out = _rate(entry.get("input_cost_per_token")), _rate(entry.get("output_cost_per_token"))
+        key = name.strip().lower()
+        if inp is None or out is None or not key:
+            continue
+        read = _rate(entry.get("cache_read_input_token_cost"))
+        write = _rate(entry.get("cache_creation_input_token_cost"))
+        table[key] = (inp, inp if read is None else read, inp if write is None else write, out)
+    aliases = {}
+    for key, rate in table.items():
+        bare = key.rsplit("/", 1)[-1]
+        if bare and bare != key and bare not in table:
+            aliases[bare] = rate if aliases.get(bare, rate) == rate else None
+    table.update({k: v for k, v in aliases.items() if v is not None})
+    return table
+
+
+def lookup_rate(table, model):
+    key = (model or "").strip().lower().split("[", 1)[0]  # claude-fable-5-1[1m] -> claude-fable-5-1
+    if not key or key.rsplit("/", 1)[-1] in UNPRICEABLE_MODELS:
+        return None
+    return table.get(key)
+
+
+def price(rate, t):
+    """(estimated cost, cache savings) in USD for a totals dict, or (0, 0) if unpriced."""
+    if rate is None:
+        return 0.0, 0.0
+    inp, read, write, out = rate
+    cost = t["input"] * inp + t["cached"] * read + t["cache_write"] * write + t["output"] * out
+    return cost, t["cached"] * (inp - read)
+
+
+class Prices:
+    """The LiteLLM rate table, refreshed daily and cached on disk for offline starts."""
+
+    def __init__(self, url, cache_path):
+        self.url = url
+        self.cache_path = Path(cache_path) if cache_path else None
+        self.table, self.fetched, self.status = {}, None, "unavailable"
+        self.lock = threading.Lock()
+        if self.cache_path and self.cache_path.exists():
+            try:
+                cached = json.loads(self.cache_path.read_text())
+                self.table = parse_rate_table(cached["document"])
+                self.fetched, self.status = float(cached["fetched"]), "cached"
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                log.warning("ignoring unreadable price cache: %s", e)
+
+    def rate(self, model):
+        return lookup_rate(self.table, model)
+
+    def refresh(self, force=False):
+        if not self.url or (not force and self.fetched and time.time() - self.fetched < PRICES_TTL_SECONDS):
+            return
+        with self.lock:
+            try:
+                with urllib.request.urlopen(self.url, timeout=30) as resp:
+                    document = json.load(resp)
+            except (OSError, ValueError, urllib.error.URLError) as e:
+                log.warning("price table fetch failed: %s", e)
+                return
+            table = parse_rate_table(document)
+            if not table:
+                return
+            self.table, self.fetched, self.status = table, time.time(), "fresh"
+            if self.cache_path:
+                tmp = self.cache_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"fetched": self.fetched, "document": document}))
+                tmp.replace(self.cache_path)
+            log.info("loaded prices for %d models", len(table))
+
+
+class PriceRefresher(threading.Thread):
+    def __init__(self, prices):
+        super().__init__(daemon=True, name="prices")
+        self.prices = prices
+
+    def run(self):
+        while True:
+            self.prices.refresh()
+            time.sleep(3600)
+
+
 # --- Aggregation -----------------------------------------------------------
 
 RANGES = {  # name -> (span, bucket)
@@ -485,7 +597,11 @@ def _totals(row):
     return d
 
 
-def summarize(db, labels, range_name, metric="tokens", now=None):
+METRICS = {"tokens": "Total tokens", "requests": "Requests", "cost": "Est. cost"}
+SORT_KEYS = {"tokens": "total", "requests": "requests", "cost": "cost"}
+
+
+def summarize(db, labels, range_name, metric="tokens", now=None, prices=None):
     now = now or datetime.now().astimezone()
     edges = bucket_edges(now, range_name)
     start = edges[0].timestamp()
@@ -498,6 +614,9 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
     for r in db.execute(f"SELECT key_hash, auth_index, source, model, {TOTALS} FROM requests "
                         "WHERE ts >= ? GROUP BY key_hash, auth_index, source, model", (start,)):
         t = _totals(r)
+        rate = prices.rate(r["model"]) if prices else None
+        t["cost"], t["savings"] = price(rate, t)
+        t["unpriced"] = 0 if rate else t["requests"]
         for table, name in ((by_client, labels.name(r["key_hash"])),
                             (by_account, account(r["auth_index"], r["source"])),
                             (by_model, r["model"] or "Unknown")):
@@ -513,7 +632,7 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
             lat = acc.pop("_lat")
             acc["latency_ms"] = round(lat / acc["requests"]) if acc["requests"] else 0
             rows.append({"name": label, **acc})
-        tables[name] = sorted(rows, key=lambda x: -x["total" if metric == "tokens" else "requests"])
+        tables[name] = sorted(rows, key=lambda x: -x[SORT_KEYS[metric]])
 
     # Series keep a fixed order (labels file first) so a client's color never depends on rank.
     known = labels.order()
@@ -524,15 +643,23 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
 
     starts = [e.timestamp() for e in edges]
     values = [[0] * len(series) for _ in edges]
-    column = "total_tokens" if metric == "tokens" else "1"
-    for r in db.execute(f"SELECT key_hash, CAST(ts / 3600 AS INTEGER) AS hour, SUM({column}) AS v "
-                        "FROM requests WHERE ts >= ? GROUP BY key_hash, hour", (start,)):
+    for r in db.execute(f"SELECT key_hash, model, CAST(ts / 3600 AS INTEGER) AS hour, {TOTALS} "
+                        "FROM requests WHERE ts >= ? GROUP BY key_hash, model, hour", (start,)):
         i = bisect.bisect_right(starts, r["hour"] * 3600) - 1
         s = index.get(labels.name(r["key_hash"]))  # None if the row landed after the tables were read
-        if i >= 0 and s is not None:
-            values[i][s] += r["v"] or 0
+        if i < 0 or s is None:
+            continue
+        if metric == "cost":
+            values[i][s] += price(prices.rate(r["model"]) if prices else None, _totals(r))[0]
+        else:
+            values[i][s] += (r["total"] if metric == "tokens" else r["requests"]) or 0
+    if metric == "cost":
+        values = [[round(v, 4) for v in row] for row in values]
 
     overall = _totals(db.execute(f"SELECT {TOTALS} FROM requests WHERE ts >= ?", (start,)).fetchone())
+    for k in ("cost", "savings", "unpriced"):
+        overall[k] = sum(c[k] for c in tables["clients"])
+    rates = {m["name"]: prices.rate(m["name"]) if prices else None for m in tables["models"]}
     failures = [dict(r) | {"client": labels.name(r["key_hash"]), "account": account(r["auth_index"], r["source"])}
                 for r in db.execute("SELECT ts, key_hash, auth_index, source, model, endpoint, latency_ms "
                                     "FROM requests WHERE failed = 1 AND ts >= ? ORDER BY ts DESC LIMIT 15",
@@ -553,6 +680,14 @@ def summarize(db, labels, range_name, metric="tokens", now=None):
         **tables,
         "failures": failures,
         "quotas": quotas,
+        "prices": {
+            "source": prices.url if prices else None,
+            "status": prices.status if prices else "disabled",
+            "fetched": prices.fetched if prices else None,
+            "per_million": {m: None if r is None else dict(zip(("input", "cache_read", "cache_write", "output"),
+                                                                (round(x * 1e6, 4) for x in r)))
+                            for m, r in rates.items()},
+        },
         "collector": {
             "last_ok": float(meta["last_ok"]) if meta.get("last_ok") else None,
             "last_error": meta.get("last_error") or None,
@@ -570,6 +705,13 @@ def compact(n):
             v = n / size
             return f"{v:.1f}".rstrip("0").rstrip(".") + unit
     return f"{n:,.0f}"
+
+
+def money(v, short=False):
+    v = float(v or 0)
+    if short and v >= 1000:
+        return "$" + compact(v)
+    return f"${v:,.0f}" if v >= 100 else f"${v:,.2f}"
 
 
 def nice_max(v):
@@ -590,6 +732,7 @@ def column_path(x, y, w, h, r):
 
 
 def chart_svg(summary):
+    fmt = (lambda v: money(v, short=True)) if summary["metric"] == "cost" else compact  # noqa: E731
     W, H, left, right, top, bottom = 960, 260, 56, 8, 12, 28
     pw, ph = W - left - right, H - top - bottom
     buckets, n = summary["buckets"], len(summary["buckets"])
@@ -602,7 +745,7 @@ def chart_svg(summary):
         y = top + ph - ph * i / 4
         cls = "baseline" if i == 0 else "grid"
         parts.append(f'<line class="{cls}" x1="{left}" x2="{W - right}" y1="{y:.1f}" y2="{y:.1f}"/>')
-        parts.append(f'<text class="tick" x="{left - 8}" y="{y + 4:.1f}" text-anchor="end">{compact(v)}</text>')
+        parts.append(f'<text class="tick" x="{left - 8}" y="{y + 4:.1f}" text-anchor="end">{fmt(v)}</text>')
     every = max(1, -(-n // 8))
     for i, b in enumerate(buckets):
         cx = left + band * i + band / 2
@@ -728,7 +871,7 @@ def name_html(name, swatch=None):
     return escape(name)
 
 
-def table_html(title, rows, first, swatches=None):
+def table_html(title, rows, first, swatches=None, extra=""):
     top = max((r["total"] for r in rows), default=0) or 1
 
     def dim(v, text=None):
@@ -741,17 +884,36 @@ def table_html(title, rows, first, swatches=None):
                 f'<td>{r["requests"]:,}</td>'
                 f'<td class="tot"><span class="share"><i class="{fill}" style="width:{100 * r["total"] / top:.1f}%">'
                 f'</i></span><strong>{compact(r["total"])}</strong></td>'
+                f'<td class="cost">{money(r["cost"]) if r["cost"] else "—"}'
+                f'{"<sup title=\"Some requests use a model with no known price\">*</sup>" if r["unpriced"] else ""}</td>'
                 + dim(r["input"], compact(r["input"])) + dim(r["cached"], compact(r["cached"]))
                 + dim(r["cache_write"], compact(r["cache_write"])) + dim(r["output"], compact(r["output"]))
                 + dim(r["failed"], f'{r["failed"]:,}')
                 + f'<td class="dim">{r["latency_ms"] / 1000:.1f}s</td></tr>')
 
     head = (f'<tr><th class="name">{escape(first)}</th><th>Requests</th><th class="tot">Total tokens</th>'
-            '<th>Uncached</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Failed</th>'
+            '<th>Est. cost</th><th>Uncached</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Failed</th>'
             '<th>Avg latency</th></tr>')
-    body = "".join(row(r) for r in rows) or '<tr><td colspan="9" class="empty">No requests in this range</td></tr>'
+    body = "".join(row(r) for r in rows) or '<tr><td colspan="10" class="empty">No requests in this range</td></tr>'
     return (f'<section><div class="sec-head"><h2>{escape(title)}</h2></div>'
-            f'<div class="scroll"><table class="data">{head}{body}</table></div></section>')
+            f'<div class="scroll"><table class="data">{head}{body}</table></div>{extra}</section>')
+
+
+def prices_html(summary):
+    p = summary["prices"]
+    if p["status"] == "disabled":
+        return ""
+    cell = lambda v: f"<td>${v:,.2f}</td>"  # noqa: E731
+    rows = "".join(
+        f'<tr><td class="name">{escape(m)}</td>'
+        + ("".join(cell(r[k]) for k in ("input", "cache_read", "cache_write", "output")) if r
+           else '<td colspan="4" class="dim">Not in the price table; counted as $0</td>') + "</tr>"
+        for m, r in p["per_million"].items())
+    fetched = f"fetched {ago(p['fetched'])}" if p["fetched"] else "not loaded yet"
+    return ('<details><summary>Prices used (per 1M tokens)</summary><div class="scroll"><table>'
+            '<tr><th>Model</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr>'
+            f'{rows}</table></div><p class="note">From the <a href="{escape(p["source"] or "")}">LiteLLM price table</a>, '
+            f'{fetched}. Cache writes use the 5-minute rate; fast and priority tiers are not distinguished.</p></details>')
 
 
 STYLE = """
@@ -835,6 +997,9 @@ tr:last-child td { border-bottom:0; }
 th:first-child, td:first-child, .name { text-align:left; }
 td.name { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
 td.dim { color:var(--ink-2); } td.dim.zero { color:var(--muted); }
+td.cost { font-weight:500; } td.cost sup { color:var(--muted); margin-left:1px; }
+.note { color:var(--muted); font-size:12px; margin:8px 2px 0; }
+details .note a { color:var(--ink-2); }
 td.tot strong { font-weight:600; display:inline-block; min-width:4.2em; }
 .share { display:inline-block; position:relative; width:64px; height:6px; border-radius:999px; background:var(--grid);
   vertical-align:middle; margin-right:10px; overflow:hidden; }
@@ -869,7 +1034,8 @@ function show(el, x, y) {
     const label = document.createElement('span');
     if (i >= 0) { const k = document.createElement('i'); k.className = 'key kl' + Math.min(i, 5); label.append(k); }
     label.append(document.createTextNode(name));
-    const value = document.createElement('b'); value.textContent = v.toLocaleString();
+    const value = document.createElement('b');
+    value.textContent = data.metric === 'cost' ? '$' + v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : v.toLocaleString();
     row.append(label, value); tip.append(row);
   }
   tip.style.display = 'block';
@@ -892,13 +1058,17 @@ def render(summary, title):
         f'<a href="?{key}={o}&{other}"{" aria-current=page" if o == cur else ""}>{escape(lbl)}</a>'
         for o, lbl in options)
     ranges = seg("range", [(r, "Last " + r) for r in RANGES], rng, f"metric={metric}")
-    metrics = seg("metric", [("tokens", "Tokens"), ("requests", "Requests")], metric, f"range={rng}")
+    metrics = seg("metric", [("tokens", "Tokens"), ("requests", "Requests"), ("cost", "Est. cost")], metric,
+                  f"range={rng}")
     fail_rate = f"{100 * t['failed'] / t['requests']:.1f}%" if t["requests"] else "0%"
     tiles = "".join(f'<div class="tile"><div class="label">{lbl}</div><div class="value">{v}</div></div>' for lbl, v in (
         ("Requests", compact(t["requests"])), ("Total tokens", compact(t["total"])),
-        ("Output tokens", compact(t["output"])), ("Failed requests", fail_rate)))
+        ("Est. API cost", money(t["cost"], short=True)), ("Saved by caching", money(t["savings"], short=True)),
+        ("Failed requests", fail_rate)))
+    unpriced = (f' {t["unpriced"]:,} requests used models with no known price and count as $0.'
+                if t["unpriced"] else "")
     legend = "".join(f'<span><i class="k{min(i, 5)}"></i>{escape(s)}</span>' for i, s in enumerate(summary["series"]))
-    unit = "Total tokens" if metric == "tokens" else "Requests"
+    unit = METRICS[metric]
     bucket_rows = "".join(
         "<tr><td>{}</td>{}<td>{:,}</td></tr>".format(
             escape(b["start"].replace("T", " ")), "".join(f"<td>{v:,}</td>" for v in b["values"]), sum(b["values"]))
@@ -918,7 +1088,8 @@ def render(summary, title):
               + (f' · last error: <span class="bad">{escape(c["last_error"])}</span>' if c["last_error"] else "")
               + f' · history since {datetime.fromtimestamp(c["oldest_record"]).strftime("%b %-d %Y %H:%M") if c["oldest_record"] else "—"}'
               + ' · <a href="/api/summary?range=' + rng + '">JSON</a>')
-    chart_json = json.dumps({"series": summary["series"], "buckets": summary["buckets"]}).replace("</", "<\\/")
+    chart_json = json.dumps({"series": summary["series"], "buckets": summary["buckets"],
+                             "metric": metric}).replace("</", "<\\/")
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)}</title>
 <style>{STYLE}</style></head><body><main>
@@ -926,11 +1097,13 @@ def render(summary, title):
 {quotas_html(summary["quotas"])}
 <div class="filters"><div class="seg">{ranges}</div><div class="seg">{metrics}</div></div>
 <div class="tiles">{tiles}</div>
+<p class="note">Costs are estimates at public API list prices. These accounts are subscriptions, so this is what the
+traffic would cost on the API, not what is paid.{unpriced}</p>
 <section><div class="sec-head"><h2 id="chart-title">{unit} by client</h2></div><div class="legend">{legend}</div>{chart_svg(summary)}
 <details><summary>Chart data</summary><div class="scroll"><table>{bucket_head}{bucket_rows}</table></div></details></section>
 {table_html("By client", summary["clients"], "Client", swatches)}
 {table_html("By upstream account", summary["accounts"], "Account")}
-{table_html("By model", summary["models"], "Model")}
+{table_html("By model", summary["models"], "Model", extra=prices_html(summary))}
 <section><div class="sec-head"><h2>Recent failures</h2></div><div class="scroll"><table class="failures"><tr><th>Time</th>
 <th>Client</th><th>Account</th><th>Model</th><th>Endpoint</th><th>Latency</th></tr>{failures}</table></div></section>
 <div class="status">{status}</div></main><div id="tip" role="tooltip"></div>
@@ -939,7 +1112,7 @@ def render(summary, title):
 
 # --- HTTP ------------------------------------------------------------------
 
-def make_handler(db_path, labels, title):
+def make_handler(db_path, labels, title, prices=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log.debug(fmt, *args)
@@ -957,14 +1130,14 @@ def make_handler(db_path, labels, title):
             url = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             rng = q.get("range") if q.get("range") in RANGES else "24h"
-            metric = q.get("metric") if q.get("metric") in ("tokens", "requests") else "tokens"
+            metric = q.get("metric") if q.get("metric") in METRICS else "tokens"
             if url.path == "/healthz":
                 return self.send(200, "ok\n", "text/plain")
             if url.path not in ("/", "/api/summary"):
                 return self.send(404, "not found\n", "text/plain")
             db = connect(db_path)
             try:
-                summary = summarize(db, labels, rng, metric)
+                summary = summarize(db, labels, rng, metric, prices=prices)
             finally:
                 db.close()
             if url.path == "/api/summary":
@@ -984,6 +1157,9 @@ def main():
     p.add_argument("--port", type=int, default=8318)
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--title", default="CLIProxyAPI usage")
+    p.add_argument("--prices-url", default=PRICES_URL,
+                   help="LiteLLM-format price table for cost estimates; empty disables them")
+    p.add_argument("--prices-cache", help="where to keep the last price table (default: next to --db)")
     p.add_argument("--prioritize", action="store_true",
                    help="rank Claude/Codex credentials by soonest weekly reset by setting their priority")
     p.add_argument("--prioritize-interval", type=float, default=300)
@@ -993,10 +1169,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     init_db(args.db)
     api = Management(args.proxy_url, args.management_key_file)
+    prices = None
+    if args.prices_url:
+        prices = Prices(args.prices_url, args.prices_cache or str(Path(args.db).with_name("prices.json")))
+        PriceRefresher(prices).start()
     Collector(args.db, api, args.poll_interval).start()
     if args.prioritize:
         Prioritizer(args.db, api, args.prioritize_interval, args.short_window_limit).start()
-    server = ThreadingHTTPServer((args.listen, args.port), make_handler(args.db, Labels(args.labels_file), args.title))
+    server = ThreadingHTTPServer((args.listen, args.port), make_handler(args.db, Labels(args.labels_file), args.title, prices))
     log.info("dashboard on http://%s:%d", args.listen, args.port)
     server.serve_forever()
 

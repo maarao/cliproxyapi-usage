@@ -57,6 +57,14 @@ in
       type = types.str;
       default = "CLIProxyAPI usage";
     };
+    estimateCosts = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Estimate API-list-price costs from LiteLLM's public price table, fetched
+        daily from GitHub and cached in the state directory.
+      '';
+    };
     prioritize = {
       enable = lib.mkEnableOption ''
         reset-aware credential priority: every interval, read each Claude and Codex
@@ -111,7 +119,7 @@ in
           "--port" (toString cfg.port)
           "--poll-interval" (toString cfg.pollInterval)
           "--title" cfg.title
-        ] + lib.optionalString cfg.prioritize.enable (" " + lib.escapeShellArgs [
+        ] + lib.optionalString (!cfg.estimateCosts) " --prices-url ''" + lib.optionalString cfg.prioritize.enable (" " + lib.escapeShellArgs [
           "--prioritize"
           "--prioritize-interval" (toString cfg.prioritize.interval)
           "--short-window-limit" (toString cfg.prioritize.shortWindowLimit)
