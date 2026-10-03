@@ -12,7 +12,8 @@ SQLite every few seconds and serves:
   Input is split like T3 Code and CodexBar do: uncached input, cache reads and
   cache writes (Claude reports writes only inside its total), so the four token
   columns plus output always add up to the total.
-- an "Upstream accounts" table when reset-aware priority is on (below)
+- account limit cards (each window as a bar of what is left, with a pace tick)
+  when reset-aware priority is on (below)
 - `/api/summary?range=24h|7d|30d|90d&metric=tokens|requests`: the same data as JSON
 - `/healthz`
 

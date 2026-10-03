@@ -193,12 +193,39 @@ class RankTests(unittest.TestCase):
             "five_hour": {"utilization": 14.0, "resets_at": "2026-10-02T08:40:00.319010+00:00"},
             "seven_day": {"utilization": 89.0, "resets_at": "2026-10-05T10:00:00.319032+00:00"}})
         self.assertEqual((short["used"], long["used"], blocked), (14.0, 89.0, False))
+        self.assertEqual((short["window"], long["window"]), (18000, 604800))
         self.assertLess(short["reset"], long["reset"])
         short, long, blocked = u.codex_windows({"rate_limit": {
             "allowed": True, "limit_reached": False, "secondary_window": None,
             "primary_window": {"used_percent": 49, "limit_window_seconds": 604800, "reset_at": 1791408823}}})
-        self.assertEqual((short, long, blocked), (None, {"used": 49.0, "reset": 1791408823}, False))
+        self.assertEqual((short, long, blocked), (None, {"used": 49.0, "reset": 1791408823, "window": 604800}, False))
         self.assertTrue(u.codex_windows({"rate_limit": {"limit_reached": True}})[2])
+
+
+class LimitsViewTests(unittest.TestCase):
+    def test_meter_shows_left_and_pace_tick(self):
+        now = 1_000_000.0
+        html = u.meter_html("5-hour", 80, now + 9000, 18000, now)  # 20% left, half the window to run
+        self.assertIn("width:20.0%", html)
+        self.assertIn("left:50.0%", html)
+        self.assertIn("ahead of pace", html)
+        self.assertIn('class="meter warn"', html)
+        self.assertIn('class="meter crit"', u.meter_html("Weekly", 95, None, None, now))
+
+    def test_window_names(self):
+        self.assertEqual([u.window_name(s, "x") for s in (18000, 604800, 86400 * 30, None)],
+                         ["5-hour", "Weekly", "30-day", "x"])
+
+    def test_old_quotas_table_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "u.db")
+            db = u.connect(path)
+            db.execute("CREATE TABLE quotas (auth_index TEXT PRIMARY KEY, label TEXT)")
+            db.commit(); db.close()
+            u.init_db(path)
+            db = u.connect(path)
+            self.assertIn("long_window", {r["name"] for r in db.execute("PRAGMA table_info(quotas)")})
+            db.close()
 
 
 class PrioritizerTests(Base):
@@ -239,7 +266,7 @@ class PrioritizerTests(Base):
         self.assertEqual(rows["c"]["error"], "claude usage unavailable")
         with u.connect(self.db_path) as db:
             html = u.render(u.summarize(db, u.Labels(None), "24h"), "Usage")
-        self.assertIn("Upstream accounts", html)
+        self.assertIn("Account limits", html)
         self.assertIn("Unreadable", html)
 
 

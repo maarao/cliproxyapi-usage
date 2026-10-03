@@ -37,7 +37,7 @@ in
       example = { "48ff0700cad2" = "Alice"; };
       description = ''
         Display names for clients, keyed by the SHA-256 hex of their CLIProxyAPI
-        API key or a prefix of it. Order here sets each client's chart color.
+        API key or a prefix of it. Chart colors follow the sorted order of these keys.
       '';
     };
     listenAddress = mkOption {

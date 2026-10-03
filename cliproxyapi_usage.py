@@ -65,8 +65,10 @@ CREATE TABLE IF NOT EXISTS quotas (
   priority INTEGER,
   short_used REAL,
   short_reset REAL,
+  short_window INTEGER,
   long_used REAL,
   long_reset REAL,
+  long_window INTEGER,
   status TEXT NOT NULL,
   error TEXT,
   checked REAL NOT NULL
@@ -86,6 +88,9 @@ def init_db(path):
     db = connect(path)
     try:
         db.executescript(SCHEMA)
+        columns = {r["name"] for r in db.execute("PRAGMA table_info(quotas)")}
+        if "long_window" not in columns:  # quotas is a cache rebuilt every round
+            db.executescript("DROP TABLE quotas;" + SCHEMA)
     finally:
         db.close()
 
@@ -268,13 +273,14 @@ PRIORITY_STEP = 10
 
 def claude_windows(usage):
     """Anthropic /api/oauth/usage -> (short, long) as {used, reset} dicts or None."""
-    def window(key):
+    def window(key, seconds):
         w = usage.get(key)
         if not isinstance(w, dict) or w.get("utilization") is None:
             return None
         reset = parse_timestamp(w["resets_at"]) if w.get("resets_at") else None
-        return {"used": float(w["utilization"]), "reset": reset}
-    return window("five_hour"), window("seven_day"), False
+        return {"used": float(w["utilization"]), "reset": reset, "window": seconds}
+    window_lengths = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+    return tuple(window(k, s) for k, s in window_lengths.items()) + (False,)
 
 
 def codex_windows(usage):
@@ -285,7 +291,8 @@ def codex_windows(usage):
         w = limits.get(key)
         if isinstance(w, dict) and w.get("used_percent") is not None:
             windows.append((int(w.get("limit_window_seconds") or 0),
-                            {"used": float(w["used_percent"]), "reset": w.get("reset_at")}))
+                            {"used": float(w["used_percent"]), "reset": w.get("reset_at"),
+                             "window": int(w.get("limit_window_seconds") or 0) or None}))
     short = next((w for secs, w in windows if secs < LONG_WINDOW_SECONDS), None)
     long = next((w for secs, w in windows if secs >= LONG_WINDOW_SECONDS), None)
     blocked = bool(limits.get("limit_reached")) or limits.get("allowed") is False
@@ -374,9 +381,11 @@ class Prioritizer(threading.Thread):
                 for position, a in enumerate(ranked, 1):
                     s, l = a["short"] or {}, a["long"] or {}
                     db.execute(
-                        "INSERT OR REPLACE INTO quotas VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO quotas (auth_index, label, provider, position, priority, "
+                        "short_used, short_reset, short_window, long_used, long_reset, long_window, status, "
+                        "error, checked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (a["auth_index"], a["label"], provider, position, a["priority"], s.get("used"),
-                         s.get("reset"), l.get("used"), l.get("reset"),
+                         s.get("reset"), s.get("window"), l.get("used"), l.get("reset"), l.get("window"),
                          blocker(a, self.short_limit) or ("Preferred" if position == 1 else "Standby"),
                          a["error"], now))
         with db:
@@ -618,45 +627,12 @@ def chart_svg(summary):
     return "".join(parts)
 
 
-def table_html(title, rows, first):
-    head = ("<tr><th>{}</th><th>Requests</th><th>Failed</th><th>Uncached input</th><th>Cache reads</th>"
-            "<th>Cache writes</th><th>Output</th><th>Total tokens</th><th>Avg latency</th></tr>").format(escape(first))
-    body = "".join(
-        f"<tr><td>{escape(str(r['name']))}</td><td>{r['requests']:,}</td><td>{r['failed']:,}</td>"
-        f"<td>{compact(r['input'])}</td><td>{compact(r['cached'])}</td>"
-        f"<td>{compact(r['cache_write'])}</td><td>{compact(r['output'])}</td>"
-        f"<td>{compact(r['total'])}</td><td>{r['latency_ms'] / 1000:.1f}s</td></tr>" for r in rows
-    ) or '<tr><td colspan="9" class="empty">No requests in this range</td></tr>'
-    return f"<section><h2>{escape(title)}</h2><table>{head}{body}</table></section>"
-
-
 def until(ts):
     if not ts:
         return ""
     s = max(0, int(float(ts) - time.time()))
     d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
-    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
-
-
-def window_cell(used, reset):
-    if used is None:
-        return "—"
-    return f"{used:.0f}% · resets in {until(reset)}" if reset else f"{used:.0f}%"
-
-
-def quotas_html(quotas):
-    if not quotas:
-        return ""
-    rows = "".join(
-        f"<tr><td>{escape(q['label'])}</td><td>{q['position']}</td><td>{escape(q['status'])}</td>"
-        f"<td>{window_cell(q['short_used'], q['short_reset'])}</td>"
-        f"<td>{window_cell(q['long_used'], q['long_reset'])}</td><td>{q['priority'] if q['priority'] is not None else '—'}</td></tr>"
-        for q in quotas)
-    checked = ago(max(q["checked"] for q in quotas))
-    return (f'<section><h2>Upstream accounts</h2><p class="sub">New sessions go to the preferred account in each '
-            f'provider: the soonest weekly reset among accounts with room left. Checked {checked}.</p>'
-            '<table class="quotas"><tr><th>Account</th><th>Rank</th><th>Status</th><th>Short window</th>'
-            f'<th>Weekly window</th><th>Priority</th></tr>{rows}</table></section>')
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m" if m else "<1m"
 
 
 def ago(ts):
@@ -666,28 +642,181 @@ def ago(ts):
     return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
 
 
+def window_name(seconds, fallback):
+    if not seconds:
+        return fallback
+    hours = seconds / 3600
+    if hours == 168:
+        return "Weekly"
+    return f"{hours:.0f}-hour" if hours < 48 else f"{hours / 24:.0f}-day"
+
+
+def meter_html(name, used, reset, window, now):
+    """One limit window as T3 Code shows it: a bar of what is left, plus a tick
+    where even spending would be (the share of the window still to run)."""
+    left = max(0.0, min(100.0, 100 - used))
+    severity = "crit" if left < 10 else "warn" if left < 25 else "ok"
+    when = f"resets in {until(reset)}" if reset else "no reset time"
+    tick, pace = "", ""
+    if reset and window:
+        time_left = max(0.0, min(100.0, 100 * (float(reset) - now) / window))
+        tick = f'<b style="left:{time_left:.1f}%"></b>'
+        pace = ("; ahead of pace" if left < time_left - 5 else "; under pace" if left > time_left + 5
+                else "; on pace")
+    label = f"{name}: {left:.0f}% left, {when}{pace}"
+    return (f'<div class="win"><span class="wl">{escape(name)}</span>'
+            f'<div class="meter {severity}" role="img" aria-label="{escape(label)}" title="{escape(label)}">'
+            f'<i style="width:{left:.1f}%"></i>{tick}</div>'
+            f'<span class="wv"><strong>{left:.0f}% left</strong><span>{escape(when)}</span></span></div>')
+
+
+BADGES = {  # status -> (status color, glyph); each badge pairs its color with a glyph and a label
+    "Preferred": ("good", "✓"), "Standby": ("neutral", ""), "Near short limit": ("warning", "!"),
+    "Limited": ("critical", "✕"), "Unreadable": ("serious", "?"),
+}
+
+
+def quotas_html(quotas, now=None):
+    if not quotas:
+        return ""
+    now = now or time.time()
+    groups = {}
+    for q in sorted(quotas, key=lambda q: (q["provider"], q["position"])):
+        groups.setdefault(q["provider"], []).append(q)
+    blocks = []
+    for provider, qs in groups.items():
+        cards = []
+        for q in qs:
+            who = q["label"][len(provider) + 1:] if q["label"].startswith(provider + " ") else q["label"]
+            short_name = window_name(q["short_window"], "5-hour")
+            kind, glyph = BADGES.get(q["status"], ("neutral", ""))
+            text = f"Near {short_name.lower()} limit" if q["status"] == "Near short limit" else q["status"]
+            badge = (f'<span class="badge {kind}"><span class="ic {kind}" aria-hidden="true">{glyph}</span>'
+                     f'{escape(text)}</span>')
+            if q["error"]:
+                body = f'<p class="err">Could not read limits: {escape(q["error"])}</p>'
+            else:
+                rows = []
+                if q["short_used"] is not None:
+                    rows.append(meter_html(short_name, q["short_used"], q["short_reset"], q["short_window"], now))
+                if q["long_used"] is not None:
+                    rows.append(meter_html(window_name(q["long_window"], "Weekly"), q["long_used"],
+                                           q["long_reset"], q["long_window"], now))
+                body = f'<div class="wins">{"".join(rows)}</div>' if rows else '<p class="err">No limits reported</p>'
+            priority = q["priority"] if q["priority"] is not None else "unset"
+            cards.append(f'<div class="acct"><div class="acct-head"><span class="who" title="{escape(who)}">'
+                         f'{escape(who)}</span>{badge}</div>{body}'
+                         f'<div class="acct-foot">Rank {q["position"]} of {len(qs)} · priority {priority}</div></div>')
+        blocks.append(f'<div class="provider"><h3>{escape(provider.title())}</h3>'
+                      f'<div class="accts">{"".join(cards)}</div></div>')
+    checked = ago(max(q["checked"] for q in quotas))
+    return ('<section><div class="sec-head"><h2>Account limits</h2>'
+            f'<span class="muted">Checked {checked}</span></div>'
+            '<p class="intro">New sessions go to the account whose weekly limit resets soonest, skipping any '
+            'near its short limit. Bars show what is left; the tick marks where even spending would be, so a '
+            'bar ending left of its tick is ahead of pace.</p>'
+            f'{"".join(blocks)}</section>')
+
+
+def name_html(name, swatch=None):
+    name = str(name)
+    provider, _, rest = name.partition(" ")
+    if swatch is not None:
+        return f'<i class="sw k{swatch}"></i>{escape(name)}'
+    if rest and "@" in rest and provider.isalpha() and provider.islower():
+        return f'<span class="tag">{escape(provider.title())}</span>{escape(rest)}'
+    return escape(name)
+
+
+def table_html(title, rows, first, swatches=None):
+    top = max((r["total"] for r in rows), default=0) or 1
+
+    def dim(v, text=None):
+        return f'<td class="dim{" zero" if not v else ""}">{text if v else "—"}</td>'
+
+    def row(r):
+        swatch = (swatches or {}).get(r["name"])
+        fill = f"k{swatch}" if swatch is not None else "kacc"
+        return (f'<tr><td class="name" title="{escape(str(r["name"]))}">{name_html(r["name"], swatch)}</td>'
+                f'<td>{r["requests"]:,}</td>'
+                f'<td class="tot"><span class="share"><i class="{fill}" style="width:{100 * r["total"] / top:.1f}%">'
+                f'</i></span><strong>{compact(r["total"])}</strong></td>'
+                + dim(r["input"], compact(r["input"])) + dim(r["cached"], compact(r["cached"]))
+                + dim(r["cache_write"], compact(r["cache_write"])) + dim(r["output"], compact(r["output"]))
+                + dim(r["failed"], f'{r["failed"]:,}')
+                + f'<td class="dim">{r["latency_ms"] / 1000:.1f}s</td></tr>')
+
+    head = (f'<tr><th class="name">{escape(first)}</th><th>Requests</th><th class="tot">Total tokens</th>'
+            '<th>Uncached</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Failed</th>'
+            '<th>Avg latency</th></tr>')
+    body = "".join(row(r) for r in rows) or '<tr><td colspan="9" class="empty">No requests in this range</td></tr>'
+    return (f'<section><div class="sec-head"><h2>{escape(title)}</h2></div>'
+            f'<div class="scroll"><table class="data">{head}{body}</table></div></section>')
+
+
 STYLE = """
 :root { color-scheme: light; --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e;
-  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,0.10); --critical:#d03b3b;
+  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,0.10); --accent:#2a78d6;
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
   --s0:#2a78d6; --s1:#eb6834; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4; --s5:#898781; }
 @media (prefers-color-scheme: dark) { :root { color-scheme: dark; --page:#0d0d0d; --surface:#1a1a19;
   --ink:#ffffff; --ink-2:#c3c2b7; --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,0.10);
-  --s0:#3987e5; --s1:#d95926; --s2:#199e70; --s3:#c98500; --s4:#d55181; --s5:#6b6a65; } }
+  --accent:#3987e5; --s0:#3987e5; --s1:#d95926; --s2:#199e70; --s3:#c98500; --s4:#d55181; --s5:#6b6a65; } }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--page); color:var(--ink); font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
-main { max-width:1040px; margin:0 auto; padding:24px; }
+main { max-width:1120px; margin:0 auto; padding:28px 24px 40px; }
 header { display:flex; justify-content:space-between; align-items:baseline; gap:16px; flex-wrap:wrap; }
-h1 { font-size:20px; margin:0; } h2 { font-size:15px; margin:0 0 8px; }
-.sub { color:var(--ink-2); }
-.filters { display:flex; gap:16px; margin:16px 0; flex-wrap:wrap; }
-.seg { display:inline-flex; border:1px solid var(--ring); border-radius:8px; overflow:hidden; }
+h1 { font-size:18px; font-weight:600; margin:0; } h2 { font-size:14px; font-weight:600; margin:0; }
+.sub, .muted { color:var(--ink-2); } .muted { font-size:12px; }
+.sec-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:12px; }
+.intro { color:var(--ink-2); margin:-4px 0 16px; max-width:78ch; font-size:13px; }
+.filters { display:flex; gap:12px; margin:24px 0 12px; flex-wrap:wrap; }
+.seg { display:inline-flex; border:1px solid var(--ring); border-radius:8px; overflow:hidden; font-size:13px; }
 .seg a { padding:6px 12px; color:var(--ink-2); text-decoration:none; }
+.seg a:hover { color:var(--ink); }
 .seg a[aria-current] { background:var(--surface); color:var(--ink); font-weight:600; box-shadow:inset 0 0 0 1px var(--ring); }
 .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
-.tile, section { background:var(--surface); border:1px solid var(--ring); border-radius:12px; padding:16px; }
-section { margin-top:16px; overflow-x:auto; }
-.tile .label { color:var(--ink-2); } .tile .value { font-size:28px; font-weight:600; }
-.legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--ink-2); margin-bottom:8px; }
+.tile, section { background:var(--surface); border:1px solid var(--ring); border-radius:12px; padding:16px 18px; }
+section { margin-top:16px; }
+.tile .label { color:var(--ink-2); font-size:13px; } .tile .value { font-size:26px; font-weight:600; margin-top:2px; }
+/* account limits */
+.provider + .provider { margin-top:20px; }
+.provider h3 { font-size:12px; font-weight:600; color:var(--ink-2); margin:0 0 8px; text-transform:uppercase; letter-spacing:.04em; }
+.accts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); gap:12px; }
+.acct { border:1px solid var(--ring); border-radius:10px; padding:14px 16px 12px; }
+.acct-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+.who { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.badge { display:inline-flex; align-items:center; gap:6px; flex-shrink:0; font-size:12px; color:var(--ink-2);
+  padding:2px 9px 2px 4px; border:1px solid var(--ring); border-radius:999px; white-space:nowrap; }
+.badge.good { color:var(--ink); font-weight:500; }
+.ic { width:15px; height:15px; border-radius:50%; display:inline-grid; place-items:center; font-size:9px;
+  font-weight:700; line-height:1; color:#ffffff; }
+.ic.good { background:var(--good); } .ic.critical { background:var(--critical); }
+.ic.warning { background:var(--warning); color:#0b0b0b; } .ic.serious { background:var(--serious); color:#0b0b0b; }
+.ic.neutral { box-shadow:inset 0 0 0 1.5px var(--muted); }
+.wins { display:flex; flex-direction:column; gap:10px; }
+.win { display:grid; grid-template-columns:4.5rem minmax(0,1fr) 7.5rem; grid-template-areas:"l m v";
+  gap:4px 14px; align-items:center; }
+.wl { grid-area:l; color:var(--ink-2); font-size:13px; } .meter { grid-area:m; } .wv { grid-area:v; }
+@media (max-width:560px) {
+  main { padding:20px 14px 32px; } .tile, section { padding:14px; } .acct { padding:12px 14px 10px; }
+  .win { grid-template-columns:1fr auto; grid-template-areas:"l v" "m m"; }
+  .wv { flex-direction:row; gap:6px; align-items:baseline; }
+}
+.meter { position:relative; height:20px; }
+.meter::before { content:""; position:absolute; inset:5px 0; border-radius:999px;
+  background:color-mix(in oklab, var(--fill) 18%, var(--surface)); }
+.meter i { position:absolute; left:0; top:5px; bottom:5px; border-radius:999px; background:var(--fill); }
+.meter b { position:absolute; top:1px; bottom:1px; width:2px; margin-left:-1px; border-radius:1px;
+  background:var(--ink); box-shadow:0 0 0 2px var(--surface); }
+.meter.ok { --fill:var(--accent); } .meter.warn { --fill:var(--warning); } .meter.crit { --fill:var(--critical); }
+.wv { display:flex; flex-direction:column; text-align:right; line-height:1.25; }
+.wv strong { font-weight:600; font-variant-numeric:tabular-nums; }
+.wv span { color:var(--ink-2); font-size:12px; font-variant-numeric:tabular-nums; }
+.acct-foot { margin-top:12px; color:var(--muted); font-size:12px; }
+.err { color:var(--ink-2); margin:0; font-size:13px; }
+/* chart */
+.legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--ink-2); margin-bottom:8px; font-size:13px; }
 .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align:-1px; }
 .chart { width:100%; height:auto; display:block; }
 .chart .grid { stroke:var(--grid); stroke-width:1; } .chart .baseline { stroke:var(--axis); stroke-width:1; }
@@ -695,19 +824,29 @@ section { margin-top:16px; overflow-x:auto; }
 .chart .hit { fill:transparent; outline:none; }
 .chart .hit:hover, .chart .hit:focus-visible { fill:var(--ink); fill-opacity:0.04; }
 .s0{fill:var(--s0)} .s1{fill:var(--s1)} .s2{fill:var(--s2)} .s3{fill:var(--s3)} .s4{fill:var(--s4)} .s5{fill:var(--s5)}
-.k0{background:var(--s0)} .k1{background:var(--s1)} .k2{background:var(--s2)} .k3{background:var(--s3)} .k4{background:var(--s4)} .k5{background:var(--s5)}
-
-table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
-th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--grid); white-space:nowrap; }
-th:first-child, td:first-child { text-align:left; } th { color:var(--ink-2); font-weight:500; }
+.k0{background:var(--s0)} .k1{background:var(--s1)} .k2{background:var(--s2)} .k3{background:var(--s3)} .k4{background:var(--s4)} .k5{background:var(--s5)} .kacc{background:var(--accent)}
+/* tables */
+.scroll { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; font-size:13px; }
+th { color:var(--muted); font-weight:500; font-size:12px; text-align:right; padding:0 10px 8px; white-space:nowrap;
+  border-bottom:1px solid var(--grid); }
+td { text-align:right; padding:9px 10px; border-bottom:1px solid var(--grid); white-space:nowrap; }
+tr:last-child td { border-bottom:0; }
+th:first-child, td:first-child, .name { text-align:left; }
+td.name { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+td.dim { color:var(--ink-2); } td.dim.zero { color:var(--muted); }
+td.tot strong { font-weight:600; display:inline-block; min-width:4.2em; }
+.share { display:inline-block; position:relative; width:64px; height:6px; border-radius:999px; background:var(--grid);
+  vertical-align:middle; margin-right:10px; overflow:hidden; }
+.share i { position:absolute; left:0; top:0; bottom:0; border-radius:999px; }
+.sw { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:8px; vertical-align:0; }
+.tag { font-size:11px; color:var(--ink-2); border:1px solid var(--ring); border-radius:4px; padding:0 5px; margin-right:8px; }
 td.empty { text-align:center; color:var(--muted); }
 .failures th:not(:last-child), .failures td:not(:last-child) { text-align:left; }
-.quotas th:nth-child(3), .quotas td:nth-child(3) { text-align:left; }
-section p.sub { margin:0 0 8px; }
-details { margin-top:12px; } summary { cursor:pointer; color:var(--ink-2); }
-.status { margin-top:16px; color:var(--muted); font-size:12px; }
-.status .bad { color:var(--critical); }
-#tip { position:fixed; pointer-events:none; background:var(--surface); border:1px solid var(--ring);
+details { margin-top:12px; font-size:13px; } summary { cursor:pointer; color:var(--ink-2); }
+.status { margin-top:20px; color:var(--muted); font-size:12px; }
+.status .bad { color:var(--critical); } .status a { color:var(--ink-2); }
+#tip { position:fixed; pointer-events:none; background:var(--surface); border:1px solid var(--ring); font-size:13px;
   border-radius:8px; padding:8px 10px; box-shadow:0 4px 16px rgba(0,0,0,0.12); display:none; min-width:160px; }
 #tip .when { color:var(--ink-2); margin-bottom:4px; }
 #tip .row { display:flex; gap:8px; align-items:center; justify-content:space-between; }
@@ -766,10 +905,12 @@ def render(summary, title):
         for b in summary["buckets"])
     bucket_head = "<tr><th>Bucket start</th>{}<th>Total</th></tr>".format(
         "".join(f"<th>{escape(s)}</th>" for s in summary["series"]))
+    swatches = {s: min(i, 5) for i, s in enumerate(summary["series"])}
     failures = "".join(
-        f"<tr><td>{datetime.fromtimestamp(f['ts']).strftime('%b %-d %H:%M:%S')}</td><td>{escape(f['client'])}</td>"
-        f"<td>{escape(str(f['account']))}</td><td>{escape(str(f['model'] or ''))}</td>"
-        f"<td>{escape(str(f['endpoint'] or ''))}</td><td>{(f['latency_ms'] or 0) / 1000:.1f}s</td></tr>"
+        f"<tr><td class='dim'>{datetime.fromtimestamp(f['ts']).strftime('%b %-d %H:%M:%S')}</td>"
+        f"<td>{escape(f['client'])}</td><td>{name_html(f['account'])}</td>"
+        f"<td class='dim'>{escape(str(f['model'] or ''))}</td><td class='dim'>{escape(str(f['endpoint'] or ''))}</td>"
+        f"<td>{(f['latency_ms'] or 0) / 1000:.1f}s</td></tr>"
         for f in summary["failures"]) or '<tr><td colspan="6" class="empty">No failed requests</td></tr>'
     c = summary["collector"]
     stale = not c["last_ok"] or time.time() - c["last_ok"] > 120
@@ -781,17 +922,17 @@ def render(summary, title):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)}</title>
 <style>{STYLE}</style></head><body><main>
-<header><h1>{escape(title)}</h1><span class="sub">Updated {escape(summary["generated"].replace("T", " "))}</span></header>
+<header><h1>{escape(title)}</h1><span class="muted">Updated {escape(summary["generated"][11:16])}</span></header>
+{quotas_html(summary["quotas"])}
 <div class="filters"><div class="seg">{ranges}</div><div class="seg">{metrics}</div></div>
 <div class="tiles">{tiles}</div>
-<section><h2 id="chart-title">{unit} by client</h2><div class="legend">{legend}</div>{chart_svg(summary)}
-<details><summary>Chart data</summary><table>{bucket_head}{bucket_rows}</table></details></section>
-{quotas_html(summary["quotas"])}
-{table_html("By client", summary["clients"], "Client")}
+<section><div class="sec-head"><h2 id="chart-title">{unit} by client</h2></div><div class="legend">{legend}</div>{chart_svg(summary)}
+<details><summary>Chart data</summary><div class="scroll"><table>{bucket_head}{bucket_rows}</table></div></details></section>
+{table_html("By client", summary["clients"], "Client", swatches)}
 {table_html("By upstream account", summary["accounts"], "Account")}
 {table_html("By model", summary["models"], "Model")}
-<section><h2>Recent failures</h2><table class="failures"><tr><th>Time</th><th>Client</th><th>Account</th><th>Model</th>
-<th>Endpoint</th><th>Latency</th></tr>{failures}</table></section>
+<section><div class="sec-head"><h2>Recent failures</h2></div><div class="scroll"><table class="failures"><tr><th>Time</th>
+<th>Client</th><th>Account</th><th>Model</th><th>Endpoint</th><th>Latency</th></tr>{failures}</table></div></section>
 <div class="status">{status}</div></main><div id="tip" role="tooltip"></div>
 <script type="application/json" id="chart-data">{chart_json}</script><script>{SCRIPT}</script></body></html>"""
 
